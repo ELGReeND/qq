@@ -5,4 +5,4 @@ Solana node Info
 chmod +x qq && ./qq
 ```
 
-![image](https://github.com/user-attachments/assets/b420a531-2a89-4fe7-94c2-47c1632eb299)
+![image](https://github.com/user-attachments/assets/0d5ef594-7ccd-49e9-a4b7-af8a7a55b77d)
