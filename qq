@@ -1,0 +1,161 @@
+#!/bin/bash
+
+# Проверяем, установлена ли программа gum
+if ! command -v gum &> /dev/null
+then
+    echo "Программа 'gum' не установлена. Выполняем установку..."
+    
+    # Вставьте ваши команды для установки gum здесь
+    sudo mkdir -p /etc/apt/keyrings
+    sudo rm -f /etc/apt/keyrings/charm.gpg
+    curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
+    sudo apt update && sudo apt install gum
+    
+    echo "Установка завершена."
+else
+    echo "Программа 'gum' уже установлена."
+    
+    # Получаем и выводим версию установленной программы
+    gum -v
+fi
+
+message=2
+
+# Диски
+declare -A disks=(
+  ["/dev/nvme0n1"]=""
+  ["/dev/nvme1n1"]=""
+  ["/dev/nvme2n1"]=""
+  ["/dev/nvme3n1"]=""
+)
+
+# Время 
+#timedatectl list-timezones
+location="Europe/Istanbul"
+
+main_1() {
+  local -n disks_=$1 # Ссылка на массив
+  local new_message=""
+
+  for disk in "${!disks_[@]}"; do # Температуры дисков
+    #disks_[$disk]=$(sudo /usr/sbin/smartctl -a $disk | grep Temperature | grep -Ev "Warning  Comp. Temperature Time|Critical Comp. Temperature Time")
+	disks_[$disk]=$(sudo /usr/sbin/smartctl -a $disk | grep Temperature | grep -Ev "Warning  Comp. Temperature Time|Critical Comp. Temperature Time" | sed 's/[^[:alnum:][:space:]:]//g' | tr -d '\n' | sed 's/Celsius/Celsius\\n/g')
+    #new_message=" $new_message $disk \n ${disks_[$disk]} \n\n"
+	new_message+="$disk \n${disks_[$disk]} \n"
+  done
+  tt=$(TZ=$location date +"%Y-%m-%d %H:%M:%S")
+  message_content="\t\t\t\t\t\tВремя обновления:  $tt \n Температура дисков:  \n$new_message \n"
+}
+
+getInfo() {
+    # Получаем порт RPC из конфигурации
+    port=$(grep -e '--rpc-port' /root/solana/solana.service | awk '{ print $2 }')
+
+    # Получаем информацию о текущей эпохе
+    c=($(solana -u http://localhost:$port epoch-info | grep "Epoch Completed Percent"))
+
+    # Получаем адрес валидатора
+    validator_address=$(solana address)
+
+    # Получаем информацию о валидаторе
+    b=( $(solana -u http://localhost:$port validators | grep $validator_address) )
+
+    # Планирование лидера
+    sche=$(solana -u http://localhost:$port leader-schedule | grep $validator_address | wc -l)
+
+    # Производительность блока
+    a=( $(solana -u http://localhost:$port -v block-production 2> /dev/null | grep -m1 $validator_address) )
+
+    # Кредиты
+    cr=($(solana -u http://localhost:$port validators --sort=credits -r -n | grep $validator_address | awk '{print $13}'))
+
+    # Среднее количество кредитов
+    crm=($(solana -u http://localhost:$port validators --output=json | jq -j '.validators | sort_by(.epochCredits) | map(select(.epochCredits>0)) | .[14:-14] | .[] | .epochCredits," ",.activatedStake,"\n"' | awk '{ c += $1 * $2; l += $2 } END { print c/l }'))
+
+    # Вычисляем отклонение
+    deviation=$(echo "scale=2; x=100 * (sqrt(($cr - $crm) ^ 2)) / $cr; if (x < 1) print 0; print x" | bc)
+    deviation_sign=$(if (( $(echo "$cr > $crm" | bc) )); then echo "(+)"; else echo "(-)"; fi)
+
+    # Синхронизация слотов
+    sync_lag=$(( $(solana slot) -  $(solana -u http://localhost:$port slot) ))
+
+    # Получаем баланс и награды
+    balance=$(solana balance)
+    rewards=$(solana balance ${b[2]})
+
+    # Получаем IP активной ноды
+    active_node_ip=$(solana gossip | grep $validator_address | awk '{print $1}')
+
+    # Формируем сообщение для отображения
+    message="\
+Адрес: $validator_address
+Воут: $(solana-keygen pubkey $(grep -e '--vote-account' /root/solana/solana.service | awk '{ print $2 }'))
+Версия: $(solana --version)
+Ip этой ноды: $(curl -4 -s ifconfig.me)
+Ip активной ноды: $active_node_ip
+
+Запланировано: $sche
+Баланс: $balance
+Награды: $rewards
+Эпоха: ${c[3]}
+Отставание синка: $sync_lag
+Кредиты: $cr  Среднее: $crm  Отклонение: $deviation%$deviation_sign"
+
+    if [ -z "$a" ]; then
+        message+="\nОчередь в расписании еще не подошла"
+    else
+        message+="\nСкипнуто: ${a[3]}\nСделано: ${a[2]}\nОсталось: $(( sche-(${a[3]}+${a[2]}) ))\nСкипрейт: ${a[4]}"
+    fi
+    
+}
+
+while true; do
+
+  getInfo
+  main_1 disks
+  
+  clear
+  echo "Info"
+  # Используем Gum для отображения информации
+  style1=$(echo -e "$message" | gum style --foreground 212 --border-foreground 12 --border double --align left --width 80 --margin "1 1" --padding "1 1")
+  style2=$(echo -e "$message_content" | gum style --foreground 212 --border-foreground 12 --border double --align left --width 80 --margin "1 1" --padding "1 1")
+  gum join --align top "$style1" "$style2"
+  CHSE=$(gum choose --header "Выполнить:" "Update_Info" "Exit" "Catchup" "Snapshot_Finder_(to_/root/solana/ledger/snapshots)" "Snapshot_Finder_(to_/root/solana/ledger)" "Snapshot_Finder_(testnet,_to_/root/solana/ledger)" "(Re)Start_Validator" "Stop_Validator")
+  
+  # Обработка выбранной опции
+  if [ "$CHSE" == "Update_Info" ]; then
+      echo "Выполняется обновление информации..."
+  elif [ "$CHSE" == "Exit" ]; then
+      break
+  elif [ "$CHSE" == "Catchup" ]; then
+      port=$(grep -e '--rpc-port' /root/solana/solana.service | awk '{ print $2 }'); \
+      fnamei=$(grep -e '--identity' /root/solana/solana.service | awk '{ print $2 }'); \
+      solana catchup $fnamei --our-localhost $port --follow --log
+  elif [ "$CHSE" == "Snapshot_Finder_(to_/root/solana/ledger/snapshots)" ]; then
+      cd && sudo rm -r -f ~/solana-snapshot-finder && sudo apt-get install python3-venv git -y \
+      && git clone https://github.com/c29r3/solana-snapshot-finder.git \
+      && cd solana-snapshot-finder && python3 -m venv venv && source ./venv/bin/activate \
+      && pip3 install -r requirements.txt && python3 snapshot-finder.py --snapshot_path $HOME/solana/ledger/snapshots --min_download_speed 50 --max_latency 500 -ipb 145.40.82.115:8899,147.28.133.137:8899,147.28.165.3:8899,147.75.87.231:8899,145.40.114.115:8899
+  elif [ "$CHSE" == "Snapshot_Finder_(to_/root/solana/ledger)" ]; then
+      cd && sudo rm -r -f ~/solana-snapshot-finder && sudo apt-get install python3-venv git -y \
+      && git clone https://github.com/c29r3/solana-snapshot-finder.git \
+      && cd solana-snapshot-finder && python3 -m venv venv && source ./venv/bin/activate \
+      && pip3 install -r requirements.txt && python3 snapshot-finder.py --snapshot_path $HOME/solana/ledger --min_download_speed 50 --max_latency 500 -ipb 145.40.82.115:8899,147.28.133.137:8899,147.28.165.3:8899,147.75.87.231:8899,145.40.114.115:8899
+  elif [ "$CHSE" == "Snapshot_Finder_(testnet,_to_/root/solana/ledger)" ]; then
+      cd && sudo rm -r -f ~/solana-snapshot-finder && sudo apt-get install python3-venv git -y \
+      && git clone https://github.com/c29r3/solana-snapshot-finder.git \
+      && cd solana-snapshot-finder && python3 -m venv venv && source ./venv/bin/activate \
+      && pip3 install -r requirements.txt && python3 snapshot-finder.py --snapshot_path $HOME/solana/ledger --min_download_speed 50 --max_latency 500 -r http://api.testnet.solana.com -ipb 145.40.82.115:8899,147.28.133.137:8899,147.28.165.3:8899,147.75.87.231:8899,145.40.114.115:8899
+  elif [ "$CHSE" == "(Re)Start_Validator" ]; then
+      fstrim / -v
+      ln -sf $HOME/solana/dummy.json $HOME/solana/i
+      systemctl daemon-reload && systemctl restart solana
+      tail -f $HOME/solana/solana.log | grep -v "solana_metrics"
+  elif [ "$CHSE" == "Stop_Validator" ]; then
+      systemctl daemon-reload && systemctl stop solana
+  else
+      echo "Неизвестная опция: $CHSE"
+  fi
+
+done
